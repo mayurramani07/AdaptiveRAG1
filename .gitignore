@@ -9,4 +9,4 @@ build/
 dist/
 .env.example
 docs/
-.CLAUDE.md
+CLAUDE.md
