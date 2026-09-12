@@ -1,0 +1,33 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """All service connectivity comes from here - never hardcode localhost or
+    a Docker service name in client code (FR27, NFR9)."""
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    app_env: str = "development"
+
+    opensearch_url: str = ""
+    opensearch_user: str = ""
+    opensearch_password: str = ""
+
+    neo4j_uri: str = ""
+    neo4j_user: str = ""
+    neo4j_password: str = ""
+
+    redis_url: str = ""
+
+    groq_api_key: str = ""
+    groq_model: str = "openai/gpt-oss-20b"
+
+    api_key: str = ""
+    rate_limit_per_minute: int = 60
+
+    cache_ttl_seconds: int = 86400
+    embedding_provider: str = ""
+
+
+def get_settings() -> Settings:
+    return Settings()
