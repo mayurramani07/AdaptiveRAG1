@@ -21,6 +21,10 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-20b"
+    # Separate small/cheap model for ingestion-time extraction (SS2.3 tier:
+    # "Small") - must never be the same model as groq_model, which is
+    # reserved for the one expensive generation call (FR18, NFR4).
+    groq_extraction_model: str = "llama-3.1-8b-instant"
 
     api_key: str = ""
     rate_limit_per_minute: int = 60
