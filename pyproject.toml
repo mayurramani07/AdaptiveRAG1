@@ -10,6 +10,12 @@ dependencies = [
     "redis>=5.0",
     "neo4j>=5.24",
     "httpx>=0.27",
+    "spacy>=3.8",
+    "dateparser>=1.2",
+    # pinned wheel URL, not `spacy download` - so `pip install .` alone
+    # fetches the NER model too (needed for a Render build step, which
+    # can't run an extra download command).
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
 ]
 
 [project.optional-dependencies]
