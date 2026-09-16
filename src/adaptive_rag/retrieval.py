@@ -119,7 +119,14 @@ def get_opensearch_client() -> OpenSearchLike:
 
     settings = get_settings()
     auth = (settings.opensearch_user, settings.opensearch_password) if settings.opensearch_user else None
-    return OpenSearch(hosts=[settings.opensearch_url], http_auth=auth, use_ssl=True, verify_certs=True)
+    # pool_maxsize: urllib3's default of 1 gets exceeded as soon as Dense
+    # and BM25 fire concurrently (planning.execute_plan's ThreadPoolExecutor
+    # fan-out) through this one shared client - observed live 2026-09-16 as
+    # a "Connection pool is full, discarding connection" warning during the
+    # first real end-to-end /v1/query request. Sized to the retrieval
+    # pool's own concurrency (planning._get_retrieval_pool's max_workers=6),
+    # not a guess.
+    return OpenSearch(hosts=[settings.opensearch_url], http_auth=auth, use_ssl=True, verify_certs=True, pool_maxsize=6)
 
 
 def index_chunk(
