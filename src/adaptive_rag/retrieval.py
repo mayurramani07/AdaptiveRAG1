@@ -234,8 +234,16 @@ class GraphRetriever:
     if a real relevance signal - traversal distance, mention frequency - is
     needed later)."""
 
-    def __init__(self, driver: Neo4jLike | None = None):
+    def __init__(self, driver: Neo4jLike | None = None, hops: int = 1):
+        # hops=1 (default): only entities the query directly names - exactly
+        # Phase 4's original query, unchanged for existing callers. hops>1:
+        # also follow RELATED_TO edges out from those entities before
+        # collecting MENTIONED_IN chunks - this is what Phase 5's Recovery
+        # Planner uses for the "Graph Expansion" strategy (SS2.5: "expand
+        # traversal depth, e.g. 1-hop to 2-hop, before concluding the graph
+        # has nothing").
         self._driver = driver
+        self._hops = hops
 
     def retrieve(self, query: str, top_k: int, filters: dict[str, str] | None) -> list[dict]:
         entities = understand_query(query).entities
@@ -249,9 +257,21 @@ class GraphRetriever:
             if active:
                 where_extra = " AND " + " AND ".join(f"d.{field} = ${field}" for field in active)
                 params.update({field: filters[field] for field in active})
+
+        entity_match = "MATCH (e:Entity) WHERE any(name IN $entities WHERE toLower(e.name) CONTAINS toLower(name) OR toLower(name) CONTAINS toLower(e.name)) "
+        if self._hops > 1:
+            entity_match += (
+                f"OPTIONAL MATCH (e)-[:RELATED_TO*1..{self._hops - 1}]-(expanded:Entity) "
+                "WITH collect(DISTINCT e) + collect(DISTINCT expanded) AS matched "
+                "UNWIND matched AS ent WITH DISTINCT ent WHERE ent IS NOT NULL "
+            )
+            traversal_source = "ent"
+        else:
+            traversal_source = "e"
+
         result = driver.execute_query(
-            "MATCH (e:Entity) WHERE any(name IN $entities WHERE toLower(e.name) CONTAINS toLower(name) OR toLower(name) CONTAINS toLower(e.name)) "
-            "MATCH (e)-[:MENTIONED_IN]->(c:Chunk)-[:PART_OF]->(d:Document) "
+            entity_match
+            + f"MATCH ({traversal_source})-[:MENTIONED_IN]->(c:Chunk)-[:PART_OF]->(d:Document) "
             "WHERE true" + where_extra + " "
             "RETURN DISTINCT c.chunk_id AS chunk_id, c.text AS text, d.doc_id AS doc_id "
             "LIMIT $top_k",

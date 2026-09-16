@@ -91,19 +91,26 @@ class FakeNeo4jReader:
     ingestion emits) - matches execute_query's real return shape
     (`.records`, each record accessible via `record["field"]`)."""
 
-    def __init__(self, entity_chunks: dict[str, list[dict]], doc_metadata: dict[str, dict] | None = None):
+    def __init__(self, entity_chunks: dict[str, list[dict]], doc_metadata: dict[str, dict] | None = None, related_entities: dict[str, list[str]] | None = None):
         # entity name (lowercase) -> list of {chunk_id, text, doc_id} it's mentioned in
         self._entity_chunks = entity_chunks
         self._doc_metadata = doc_metadata or {}
+        self._related_entities = related_entities or {}  # entity name -> RELATED_TO neighbor names, for hops>1 tests
         self.queries: list[tuple[str, dict]] = []
 
     def execute_query(self, query, **params):
         self.queries.append((query, params))
+        matched_entities = {name for name in self._entity_chunks if any(name in n.lower() or n.lower() in name for n in params["entities"])}
+        if "RELATED_TO*1.." in query:  # hops>1 - fake one level of expansion, enough to test the branch fires
+            expanded = set(matched_entities)
+            for name in matched_entities:
+                expanded |= set(self._related_entities.get(name, []))
+            matched_entities = expanded
+
         matched_chunks: dict[str, dict] = {}
-        for entity_name, chunks in self._entity_chunks.items():
-            if any(entity_name in name.lower() or name.lower() in entity_name for name in params["entities"]):
-                for chunk in chunks:
-                    matched_chunks[chunk["chunk_id"]] = chunk
+        for entity_name in matched_entities:
+            for chunk in self._entity_chunks.get(entity_name, []):
+                matched_chunks[chunk["chunk_id"]] = chunk
 
         from adaptive_rag.retrieval import FILTERABLE_FIELDS
 
@@ -538,3 +545,35 @@ def test_sync_all_rebuilds_opensearch_chunks_on_content_update():
 
     assert set(opensearch.docs.keys()) == {"doc1:0"}
     assert opensearch.docs["doc1:0"]["text"] == new_text
+
+
+# ---------------------------------------------------------------------------
+# GraphRetriever hop expansion (Phase 5's Recovery Planner "Graph Expansion"
+# strategy relies on this) - live-verified 2026-09-16 against real Neo4j
+# AuraDB: hops=1 stayed scoped to the directly-matched entity's document,
+# hops=2 correctly reached a second document through a RELATED_TO edge.
+# ---------------------------------------------------------------------------
+
+
+def test_graph_retriever_hops_1_stays_scoped_to_direct_entity():
+    driver = FakeNeo4jReader(
+        entity_chunks={
+            "steve jobs": [{"chunk_id": "doc_a:0", "text": "Steve Jobs founded Apple.", "doc_id": "doc_a"}],
+            "beats": [{"chunk_id": "doc_b:0", "text": "Apple acquired Beats.", "doc_id": "doc_b"}],
+        },
+        related_entities={"steve jobs": ["beats"]},
+    )
+    results = GraphRetriever(driver=driver, hops=1).retrieve("Steve Jobs", top_k=10, filters=None)
+    assert {r["chunk_id"] for r in results} == {"doc_a:0"}
+
+
+def test_graph_retriever_hops_2_reaches_related_entity():
+    driver = FakeNeo4jReader(
+        entity_chunks={
+            "steve jobs": [{"chunk_id": "doc_a:0", "text": "Steve Jobs founded Apple.", "doc_id": "doc_a"}],
+            "beats": [{"chunk_id": "doc_b:0", "text": "Apple acquired Beats.", "doc_id": "doc_b"}],
+        },
+        related_entities={"steve jobs": ["beats"]},
+    )
+    results = GraphRetriever(driver=driver, hops=2).retrieve("Steve Jobs", top_k=10, filters=None)
+    assert {r["chunk_id"] for r in results} == {"doc_a:0", "doc_b:0"}
