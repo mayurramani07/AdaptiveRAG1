@@ -36,6 +36,14 @@ class Settings(BaseSettings):
 
     cache_ttl_seconds: int = 86400
     embedding_provider: str = ""
+    # Dense retrieval's embedding model (Phase 4). Local/free via FastEmbed
+    # (ONNX, no torch) - sentence-transformers was tried first and measured
+    # at ~500MB+ RSS from torch alone, over Render's free-tier 512MB limit;
+    # FastEmbed measured ~180MB for this same model.
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Reranker model (FR10, SS2.3 row 10). Also FastEmbed/ONNX - no torch,
+    # same reasoning as embedding_model above.
+    reranker_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
 
 
 def get_settings() -> Settings:

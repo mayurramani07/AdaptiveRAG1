@@ -16,6 +16,8 @@ dependencies = [
     # fetches the NER model too (needed for a Render build step, which
     # can't run an extra download command).
     "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    "fastembed>=0.8",
+    "opensearch-py>=3.0",
 ]
 
 [project.optional-dependencies]

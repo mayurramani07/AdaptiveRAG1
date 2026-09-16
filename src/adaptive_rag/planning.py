@@ -21,6 +21,8 @@ mode is too noisy (e.g. it matched the word "me" as a date in testing).
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Protocol
@@ -30,6 +32,7 @@ import spacy
 
 TOP_K_DEFAULT = 20
 TOP_K_HARD_CAP = 30
+DEFAULT_RETRIEVAL_TIMEOUT_SECONDS = 3.0
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,16 @@ _CHITCHAT_PATTERNS = {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay",
 @lru_cache
 def _get_nlp():
     return spacy.load("en_core_web_sm")
+
+
+@lru_cache
+def _get_retrieval_pool() -> ThreadPoolExecutor:
+    # ponytail: one shared pool for the process, not one per call - thread
+    # creation has real OS-level cost (measured ~150-200ms per pool on
+    # Windows), so a fresh pool per request was needlessly slow. Sized for
+    # a few requests' worth of concurrent 3-way fan-out; revisit under real
+    # load (Phase 9 measurement).
+    return ThreadPoolExecutor(max_workers=6)
 
 
 @dataclass
@@ -142,19 +155,100 @@ class Retrievers:
     graph: Retriever | None = None
 
 
-def execute_plan(plan: RetrievalPlan, retrievers: Retrievers, query: str, filters: dict[str, str] | None = None) -> dict[str, list[dict]]:
-    """FR6: fires only the retrievers flagged true, applies filters only if
-    apply_filters is true, and clamps top_k to the hard cap regardless of
-    the planner's output."""
+@dataclass
+class CircuitBreaker:
+    """NFR2: opens after `failure_threshold` consecutive failures, stays
+    open for `cooldown_seconds`, then allows one more attempt. One instance
+    per dependency (dense/bm25/graph) - pass the same `breakers` dict across
+    calls to actually accumulate state; a fresh dict per call (the default)
+    means no memory between requests, which is fine for tests but the
+    caller (Phase 6 orchestration) should hold one dict for the process."""
+
+    failure_threshold: int = 3
+    cooldown_seconds: float = 30.0
+    _failures: int = field(default=0, init=False, repr=False)
+    _opened_at: float | None = field(default=None, init=False, repr=False)
+
+    def is_open(self) -> bool:
+        if self._opened_at is None:
+            return False
+        if time.monotonic() - self._opened_at >= self.cooldown_seconds:
+            self._opened_at = None
+            self._failures = 0
+            return False
+        return True
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._opened_at = None
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._failures >= self.failure_threshold:
+            self._opened_at = time.monotonic()
+
+
+def execute_plan(
+    plan: RetrievalPlan,
+    retrievers: Retrievers,
+    query: str,
+    filters: dict[str, str] | None = None,
+    breakers: dict[str, CircuitBreaker] | None = None,
+    timeout: float = DEFAULT_RETRIEVAL_TIMEOUT_SECONDS,
+) -> dict[str, list[dict]]:
+    """FR6/FR8: fires only the retrievers flagged true, in parallel, applies
+    filters only if apply_filters is true, and clamps top_k to the hard cap
+    regardless of the planner's output.
+
+    NFR1/NFR2: each retriever call gets its own timeout and circuit breaker.
+    A slow/failing retriever degrades to "no results from that retriever"
+    (SS13's documented fallback, e.g. "Neo4j down -> degrade to
+    OpenSearch-only") - it never fails the whole request.
+
+    ponytail: a genuinely hung synchronous retriever call can't be killed
+    in Python, only abandoned - the shared pool below just stops waiting on
+    it, but the thread itself leaks until it eventually returns or errors
+    on its own, permanently occupying one worker slot. This is the outer
+    safety net; retriever implementations should still set their own
+    client-level timeouts (Phase 4's OpenSearch/Neo4j calls) so hangs are
+    rare and bounded at the source. A circuit breaker naturally throttles
+    how often a stuck dependency gets sent more work, which limits (but
+    doesn't eliminate) pool exhaustion from repeated hangs - revisit if
+    that turns out to matter under real load (Phase 9 measurement).
+    """
     top_k = clamp_top_k(plan.top_k)
     applied_filters = filters if plan.apply_filters else None
+    breakers = breakers if breakers is not None else {}
+
+    tasks = [
+        (name, retriever)
+        for name, retriever, flag in (
+            ("dense", retrievers.dense, plan.dense),
+            ("bm25", retrievers.bm25, plan.bm25),
+            ("graph", retrievers.graph, plan.graph),
+        )
+        if flag and retriever is not None
+    ]
+    if not tasks:
+        return {}
+
+    pool = _get_retrieval_pool()
     results: dict[str, list[dict]] = {}
-    if plan.dense and retrievers.dense:
-        results["dense"] = retrievers.dense.retrieve(query, top_k, applied_filters)
-    if plan.bm25 and retrievers.bm25:
-        results["bm25"] = retrievers.bm25.retrieve(query, top_k, applied_filters)
-    if plan.graph and retrievers.graph:
-        results["graph"] = retrievers.graph.retrieve(query, top_k, applied_filters)
+    futures = {}
+    for name, retriever in tasks:
+        breaker = breakers.setdefault(name, CircuitBreaker())
+        if breaker.is_open():
+            logger.warning("circuit_open", extra={"retriever": name})
+            continue
+        futures[name] = (pool.submit(retriever.retrieve, query, top_k, applied_filters), breaker)
+
+    for name, (future, breaker) in futures.items():
+        try:
+            results[name] = future.result(timeout=timeout)
+            breaker.record_success()
+        except Exception:
+            breaker.record_failure()
+            logger.warning("retriever_failed", extra={"retriever": name}, exc_info=True)
     return results
 
 
