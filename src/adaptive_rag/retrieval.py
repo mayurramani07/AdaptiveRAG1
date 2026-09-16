@@ -112,10 +112,26 @@ def get_embedding_provider() -> EmbeddingLike:
     return FastEmbedProvider()
 
 
+class IndicesLike(Protocol):
+    def exists(self, *, index: str) -> bool: ...
+    def create(self, *, index: str, body: dict[str, Any]) -> Any: ...
+
+
 class OpenSearchLike(Protocol):
     def index(self, *, index: str, body: dict[str, Any], id: str) -> Any: ...
     def search(self, *, index: str, body: dict[str, Any]) -> dict[str, Any]: ...
     def delete_by_query(self, *, index: str, body: dict[str, Any]) -> Any: ...
+    indices: IndicesLike
+
+
+def ensure_index(client: OpenSearchLike | None = None, index: str = DEFAULT_INDEX) -> None:
+    """Phase 9 hardening: a fresh free-tier OpenSearch deployment has no
+    `documents` index yet - every write/search before this point 404s.
+    Idempotent (checks `indices.exists` first), so it's safe to call from
+    both `sync_all` (scheduled re-ingestion) and app startup."""
+    search_client = client or get_opensearch_client()
+    if not search_client.indices.exists(index=index):
+        search_client.indices.create(index=index, body=INDEX_MAPPING)
 
 
 @lru_cache
@@ -388,6 +404,7 @@ def ingest_and_index(
     nothing supplies this automatically yet."""
     from adaptive_rag.ingestion import chunk_document, ingest_document
 
+    ensure_index(opensearch_client)
     ingest_document(driver, doc_id, text, llm=llm)
     if metadata:
         _set_document_metadata(driver, doc_id, metadata)
@@ -416,6 +433,7 @@ def sync_all(
     from adaptive_rag.ingestion import chunk_document, sync_graph
 
     client = opensearch_client or get_opensearch_client()
+    ensure_index(client, index=index)
     metadata_by_doc = metadata_by_doc or {}
     keep_ids = list(documents.keys())
 

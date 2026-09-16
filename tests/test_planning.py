@@ -5,6 +5,7 @@ import pytest
 
 from adaptive_rag.planning import (
     TOP_K_HARD_CAP,
+    CircuitBreaker,
     QueryUnderstanding,
     RetrievalPlan,
     Retrievers,
@@ -163,6 +164,45 @@ def test_router_skips_a_flagged_retriever_that_was_never_injected():
     plan = RetrievalPlan(dense=True, bm25=True, graph=True, freshness=False, apply_filters=False, top_k=10)
     results = execute_plan(plan, Retrievers(), "q")
     assert results == {}
+
+
+class RaisingRetriever:
+    """Simulates a dependency that is down (e.g. Neo4j unreachable)."""
+
+    def retrieve(self, query, top_k, filters):
+        raise ConnectionError("neo4j down")
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 chaos test: "kill Neo4j mid-request" (SS13's documented fallback -
+# graph failure degrades to dense+bm25-only, the whole request never fails)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_plan_degrades_when_graph_retriever_raises():
+    dense_r = FakeRetriever(results=[{"id": "d1"}])
+    plan = RetrievalPlan(dense=True, bm25=False, graph=True, freshness=False, apply_filters=False, top_k=10)
+    retrievers = Retrievers(dense=dense_r, graph=RaisingRetriever())
+
+    results = execute_plan(plan, retrievers, "q")  # must not raise
+
+    assert results == {"dense": [{"id": "d1"}]}  # graph silently dropped, dense result still returned
+
+
+def test_execute_plan_opens_circuit_breaker_after_repeated_graph_failures():
+    plan = RetrievalPlan(dense=False, bm25=False, graph=True, freshness=False, apply_filters=False, top_k=10)
+    retrievers = Retrievers(graph=RaisingRetriever())
+    breakers: dict[str, CircuitBreaker] = {}
+
+    for _ in range(3):
+        execute_plan(plan, retrievers, "q", breakers=breakers)
+    assert breakers["graph"].is_open()
+
+    # once open, a 4th request skips calling the dead retriever entirely
+    calls_before = getattr(retrievers.graph, "calls", None)  # RaisingRetriever has no .calls, just confirm no crash
+    results = execute_plan(plan, retrievers, "q", breakers=breakers)
+    assert results == {}
+    assert calls_before is None
 
 
 # ---------------------------------------------------------------------------

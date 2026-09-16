@@ -10,6 +10,7 @@ from adaptive_rag.retrieval import (
     FastEmbedProvider,
     FastEmbedReranker,
     GraphRetriever,
+    ensure_index,
     index_chunk,
     ingest_and_index,
     reciprocal_rank_fusion,
@@ -28,6 +29,20 @@ class FakeEmbeddingProvider:
         return [[float(i) for i in range(self.dim)] for _ in texts]
 
 
+class FakeIndices:
+    """Matches opensearch-py's `client.indices.exists`/`.create` shape,
+    used by `ensure_index` (Phase 9 hardening)."""
+
+    def __init__(self):
+        self.created: set[str] = set()
+
+    def exists(self, *, index):
+        return index in self.created
+
+    def create(self, *, index, body):
+        self.created.add(index)
+
+
 class FakeOpenSearch:
     """In-memory stand-in matching opensearch-py's real keyword-only
     `index(*, index, body, id)` / `search(*, index, body)` signatures
@@ -36,6 +51,7 @@ class FakeOpenSearch:
     def __init__(self):
         self.docs: dict[str, dict] = {}
         self.search_calls: list[tuple[str, dict]] = []
+        self.indices = FakeIndices()
 
     def index(self, *, index, body, id):
         self.docs[id] = {"_index": index, **body}
@@ -514,6 +530,25 @@ def test_ingest_and_index_stores_metadata_in_both_stores():
     stored_chunk = next(iter(opensearch.docs.values()))
     assert stored_chunk["doc_type"] == "policy"
     assert stored_chunk["department"] == "finance"
+
+
+# ---------------------------------------------------------------------------
+# ensure_index (Phase 9 hardening) - a fresh free-tier deployment has no
+# index yet; the first ingestion write/search must not 404.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_index_creates_index_when_missing():
+    opensearch = FakeOpenSearch()
+    ensure_index(opensearch, index="documents")
+    assert opensearch.indices.exists(index="documents")
+
+
+def test_ensure_index_is_a_noop_when_index_already_exists():
+    opensearch = FakeOpenSearch()
+    opensearch.indices.create(index="documents", body={})
+    ensure_index(opensearch, index="documents")  # must not raise / recreate
+    assert opensearch.indices.exists(index="documents")
 
 
 def test_sync_all_removes_deleted_document_from_both_stores():

@@ -28,7 +28,7 @@ from adaptive_rag.grounding import (
     select_mode,
 )
 from adaptive_rag.logging import configure_logging
-from adaptive_rag.observability import record_eval_event
+from adaptive_rag.observability import check_dependency_health, record_eval_event
 from adaptive_rag.pipeline import run_pipeline
 from adaptive_rag.recovery import INSUFFICIENT_EVIDENCE_MESSAGE
 
@@ -39,10 +39,9 @@ app = FastAPI(title="Adaptive RAG")
 
 
 @app.get("/v1/health")
-def health() -> dict:
-    # Real per-dependency reachability checks land when this endpoint is
-    # extended to actually ping OpenSearch/Neo4j/Redis/Groq - not done yet.
-    return {"status": "ok"}
+async def health() -> dict:
+    deps = await check_dependency_health()
+    return {"status": "ok" if all(v == "ok" for v in deps.values()) else "degraded", "dependencies": deps}
 
 
 class QueryRequest(BaseModel):

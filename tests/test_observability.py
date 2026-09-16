@@ -6,6 +6,7 @@ import pytest
 from adaptive_rag.observability import (
     METRICS,
     MetricsRegistry,
+    check_dependency_health,
     check_index_staleness,
     get_eval_event,
     record_eval_event,
@@ -29,14 +30,20 @@ class FakeOpenSearchAgg:
 
 
 class FakeRedis:
-    def __init__(self):
+    def __init__(self, ping_ok=True):
         self.store: dict[str, str] = {}
+        self.ping_ok = ping_ok
 
     async def get(self, key):
         return self.store.get(key)
 
     async def set(self, key, value, ex=None):
         self.store[key] = value
+
+    async def ping(self):
+        if not self.ping_ok:
+            raise ConnectionError("redis down")
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -200,3 +207,61 @@ def test_check_index_staleness_custom_threshold():
     client = FakeOpenSearchAgg(most_recent=datetime.now(UTC) - timedelta(hours=2))
     result = check_index_staleness(client=client, index="documents", max_age_hours=1.0)
     assert result["stale"] is True  # 2h old, but threshold is 1h
+
+
+# ---------------------------------------------------------------------------
+# check_dependency_health (Phase 9 hardening) - /v1/health per-dependency
+# ---------------------------------------------------------------------------
+
+
+class FakeNeo4jDriver:
+    def __init__(self, ok=True):
+        self.ok = ok
+
+    def verify_connectivity(self):
+        if not self.ok:
+            raise ConnectionError("neo4j unreachable")
+
+
+class FakeOpenSearchClient:
+    def __init__(self, ok=True):
+        self.ok = ok
+
+    def ping(self):
+        if not self.ok:
+            raise ConnectionError("opensearch unreachable")
+        return True
+
+
+class FakeGroqResponse:
+    def raise_for_status(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_check_dependency_health_all_ok(monkeypatch):
+    monkeypatch.setattr("httpx.get", lambda *a, **k: FakeGroqResponse())
+    result = await check_dependency_health(
+        redis_client=FakeRedis(), neo4j_driver=FakeNeo4jDriver(), opensearch_client=FakeOpenSearchClient(), groq_api_key="fake-key"
+    )
+    assert result == {"redis": "ok", "neo4j": "ok", "opensearch": "ok", "groq": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_check_dependency_health_reports_one_failure_without_affecting_others(monkeypatch):
+    monkeypatch.setattr("httpx.get", lambda *a, **k: FakeGroqResponse())
+    result = await check_dependency_health(
+        redis_client=FakeRedis(ping_ok=False), neo4j_driver=FakeNeo4jDriver(), opensearch_client=FakeOpenSearchClient(), groq_api_key="fake-key"
+    )
+    assert result["redis"].startswith("error:")
+    assert result["neo4j"] == "ok"
+    assert result["opensearch"] == "ok"
+    assert result["groq"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_check_dependency_health_reports_missing_groq_key():
+    result = await check_dependency_health(
+        redis_client=FakeRedis(), neo4j_driver=FakeNeo4jDriver(), opensearch_client=FakeOpenSearchClient(), groq_api_key=""
+    )
+    assert "GROQ_API_KEY" in result["groq"]

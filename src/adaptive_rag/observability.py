@@ -169,3 +169,65 @@ def check_index_staleness(client: OpenSearchAggLike | None = None, index: str | 
     most_recent = datetime.fromisoformat(most_recent_str)
     age_hours = (datetime.now(UTC) - most_recent).total_seconds() / 3600
     return {"stale": age_hours > max_age_hours, "most_recent_ingested_at": most_recent.isoformat(), "age_hours": round(age_hours, 2)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 hardening: /v1/health was a stub ({"status": "ok"} unconditionally)
+# since Phase 1, deferred pending real dependency clients - all four now
+# exist, so SS9.2's literal spec ("per-dependency health") is implementable.
+# ---------------------------------------------------------------------------
+
+DEFAULT_HEALTH_TIMEOUT_SECONDS = 3.0
+
+
+async def check_dependency_health(
+    redis_client: Any | None = None,
+    neo4j_driver: Any | None = None,
+    opensearch_client: Any | None = None,
+    groq_api_key: str | None = None,
+    timeout_seconds: float = DEFAULT_HEALTH_TIMEOUT_SECONDS,
+) -> dict[str, str]:
+    """Cheap reachability check per dependency - "ok" or "error: <reason>".
+    Each check is independent (one dependency's outage/timeout never masks
+    or blocks the others, same principle as `planning.execute_plan`'s
+    per-retriever circuit breakers) and never raises."""
+    import asyncio
+
+    import httpx
+    from starlette.concurrency import run_in_threadpool
+
+    from adaptive_rag.config import get_settings
+    from adaptive_rag.gateway import get_redis
+    from adaptive_rag.ingestion import get_neo4j_driver
+    from adaptive_rag.retrieval import get_opensearch_client
+
+    settings = get_settings()
+    redis_client = redis_client or get_redis()
+    neo4j_driver = neo4j_driver or get_neo4j_driver()
+    opensearch_client = opensearch_client or get_opensearch_client()
+    groq_api_key = settings.groq_api_key if groq_api_key is None else groq_api_key
+
+    async def _groq() -> None:
+        if not groq_api_key:
+            raise RuntimeError("GROQ_API_KEY not configured")
+        # /models, not a chat completion - reachability check must not spend tokens.
+        response = await run_in_threadpool(httpx.get, "https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {groq_api_key}"}, timeout=timeout_seconds)
+        response.raise_for_status()
+
+    checks = {
+        "redis": redis_client.ping(),
+        "neo4j": run_in_threadpool(neo4j_driver.verify_connectivity),
+        "opensearch": run_in_threadpool(opensearch_client.ping),
+        "groq": _groq(),
+    }
+
+    async def _run(name: str, coro) -> tuple[str, str]:
+        try:
+            await asyncio.wait_for(coro, timeout=timeout_seconds)
+            return name, "ok"
+        except Exception as exc:
+            logger.warning("dependency_health_check_failed", extra={"dependency": name}, exc_info=True)
+            return name, f"error: {exc}"
+
+    results = await asyncio.gather(*(_run(name, coro) for name, coro in checks.items()))
+    return dict(results)

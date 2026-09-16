@@ -81,6 +81,31 @@ HEADERS = {"x-api-key": "test-key"}
 
 
 # ---------------------------------------------------------------------------
+# GET /v1/health (Phase 9 hardening, SS9.2)
+# ---------------------------------------------------------------------------
+
+
+def test_health_reports_ok_when_all_dependencies_reachable(client, monkeypatch):
+    async def fake_check(**kwargs):
+        return {"redis": "ok", "neo4j": "ok", "opensearch": "ok", "groq": "ok"}
+
+    monkeypatch.setattr(app_module, "check_dependency_health", fake_check)
+    resp = client.get("/v1/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "dependencies": {"redis": "ok", "neo4j": "ok", "opensearch": "ok", "groq": "ok"}}
+
+
+def test_health_reports_degraded_when_one_dependency_down(client, monkeypatch):
+    async def fake_check(**kwargs):
+        return {"redis": "ok", "neo4j": "error: connection refused", "opensearch": "ok", "groq": "ok"}
+
+    monkeypatch.setattr(app_module, "check_dependency_health", fake_check)
+    resp = client.get("/v1/health")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "degraded"
+
+
+# ---------------------------------------------------------------------------
 # Mode 1, buffered (stream=False)
 # ---------------------------------------------------------------------------
 
