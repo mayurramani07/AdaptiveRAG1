@@ -20,7 +20,6 @@ OpenSearch/Neo4j provisioning were before those got signed up for.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -31,6 +30,7 @@ from adaptive_rag.grading import (
     needs_recovery,
 )
 from adaptive_rag.ingestion import LLMLike, Neo4jLike, get_llm_client
+from adaptive_rag.pii import redact_pii
 from adaptive_rag.planning import (
     TOP_K_DEFAULT,
     RetrievalPlan,
@@ -62,27 +62,6 @@ _REWRITE_SYSTEM_PROMPT = (
     'without changing its meaning or adding new facts. Respond with strict JSON only: '
     '{"rewritten_query": "..."}. No prose, JSON only.'
 )
-
-# ponytail: baseline regex redaction, not a full PII detector - matches
-# this project's documented "baseline PII hygiene only" stance (compliance
-# scope undetermined, SS9/SS10). Order matters: SSN before the looser phone
-# pattern, so a 9-digit SSN doesn't get half-swallowed by a phone match first.
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
-_CREDIT_CARD_RE = re.compile(r"\b(?:\d[ -]?){13,16}\b")
-_PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}(?!\d)")
-
-
-def redact_pii(text: str) -> str:
-    """FR15: applied to any query text before it leaves the system
-    boundary via external web search - the one step in this pipeline that
-    calls out to a third party."""
-    text = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
-    text = _SSN_RE.sub("[REDACTED_SSN]", text)
-    text = _CREDIT_CARD_RE.sub("[REDACTED_CARD]", text)
-    text = _PHONE_RE.sub("[REDACTED_PHONE]", text)
-    return text
-
 
 class WebSearchLike(Protocol):
     def search(self, query: str) -> list[dict]: ...

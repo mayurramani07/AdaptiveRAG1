@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 import uuid
@@ -27,6 +28,7 @@ from adaptive_rag.grounding import (
     select_mode,
 )
 from adaptive_rag.logging import configure_logging
+from adaptive_rag.observability import record_eval_event
 from adaptive_rag.pipeline import run_pipeline
 from adaptive_rag.recovery import INSUFFICIENT_EVIDENCE_MESSAGE
 
@@ -50,14 +52,21 @@ class QueryRequest(BaseModel):
     stream: bool = True
 
 
-def _log_grounding_result(request_id: str, future) -> None:
+def _log_grounding_result(request_id: str, route: str, recovery_used: bool, loop: asyncio.AbstractEventLoop, future) -> None:
     """FR19: Mode 1's grounding check is a detector, not a gate - its
-    result reaches the eval loop via this log line (queryable by
-    request_id, same convention `planning.log_plan_decision` established),
-    never by altering a response that already went out."""
+    result reaches the eval loop via this log line plus a Redis-backed eval
+    event (FR7: "plan + final grounding score queryable by request ID
+    within 5 minutes"), never by altering a response that already went out.
+    Runs on the grounding thread pool's worker thread (this is an
+    `add_done_callback`), not the event loop - `record_eval_event` is
+    async, so it's scheduled onto the loop captured before the background
+    check was kicked off, via `run_coroutine_threadsafe` (the standard way
+    to call async code from a non-event-loop thread)."""
     try:
         check = future.result()
         logger.info("grounding_result", extra={"request_id": request_id, "grounded": check.grounded, "confidence": check.confidence})
+        event = {"route": route, "recovery_used": recovery_used, "grounded": check.grounded, "confidence": check.confidence}
+        asyncio.run_coroutine_threadsafe(record_eval_event(request_id, event), loop)
     except Exception:
         logger.warning("grounding_check_failed", extra={"request_id": request_id}, exc_info=True)
 
@@ -121,14 +130,16 @@ async def query(req: QueryRequest, api_key: str = Depends(require_api_key)):
         }
         if passed:
             await cache_set(req.query, {k: v for k, v in payload.items() if k not in ("request_id", "cache_hit", "grounding")})
+        await record_eval_event(request_id, {"route": result.route, "recovery_used": result.recovery_used, "grounded": check.grounded, "confidence": check.confidence})
         payload["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
         return payload
 
     # Mode 1 (default)
+    loop = asyncio.get_running_loop()
     if not req.stream:
         answer = await run_in_threadpool(generate_buffered, result.messages)
         handle = check_grounding_async(answer, result.evidence)
-        handle.future.add_done_callback(lambda f: _log_grounding_result(request_id, f))
+        handle.future.add_done_callback(lambda f: _log_grounding_result(request_id, result.route, result.recovery_used, loop, f))
         payload = {
             "request_id": request_id,
             "answer": answer,
@@ -154,7 +165,7 @@ async def query(req: QueryRequest, api_key: str = Depends(require_api_key)):
             collected.append(token)
             yield format_sse_event("token", {"text": token})
         handle = check_grounding_async("".join(collected), result.evidence)
-        handle.future.add_done_callback(lambda f: _log_grounding_result(request_id, f))
+        handle.future.add_done_callback(lambda f: _log_grounding_result(request_id, result.route, result.recovery_used, loop, f))
         yield format_sse_event("grounding", {"mode": "async", "status": "pending"})
         yield format_sse_event(
             "done",

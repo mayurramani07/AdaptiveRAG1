@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from adaptive_rag.generation import build_context, extract_sources
 from adaptive_rag.grading import grade_evidence, needs_recovery
 from adaptive_rag.ingestion import LLMLike
+from adaptive_rag.observability import traced
 from adaptive_rag.planning import (
     CircuitBreaker,
     RetrievalPlan,
@@ -107,26 +108,30 @@ def run_pipeline(
     2-attempt cap without reaching Correct evidence (SS2.5) - the caller
     must return the fallback message and skip generation entirely, never
     generate from evidence already known to be inadequate."""
-    understanding = understand_query(query)
-    plan = plan_query(understanding, query)
-    log_plan_decision(request_id, query, plan)
-    route = _route_name(plan)
+    with traced("understand_and_plan", request_id=request_id):
+        understanding = understand_query(query)
+        plan = plan_query(understanding, query)
+        log_plan_decision(request_id, query, plan)
+        route = _route_name(plan)
 
     if route == "chitchat":
         return PipelineResult(plan=plan, route=route, messages=build_context(query, []), sources=[])
 
     active_retrievers = retrievers if retrievers is not None else default_retrievers()
-    results_by_retriever = execute_plan(plan, active_retrievers, query, filters=understanding.filter_candidates, breakers=_BREAKERS)
-    fused = reciprocal_rank_fusion(results_by_retriever, top_k=clamp_top_k(plan.top_k))
-    reranked = rerank_candidates(query, fused)
-    graded = grade_evidence(query, reranked, grader=grader)
+    with traced("retrieve_fuse_rerank", request_id=request_id, route=route):
+        results_by_retriever = execute_plan(plan, active_retrievers, query, filters=understanding.filter_candidates, breakers=_BREAKERS)
+        fused = reciprocal_rank_fusion(results_by_retriever, top_k=clamp_top_k(plan.top_k))
+        reranked = rerank_candidates(query, fused)
+    with traced("grade_evidence", request_id=request_id):
+        graded = grade_evidence(query, reranked, grader=grader)
 
     recovery_used = False
     if needs_recovery(graded):
-        strategies = recovery_strategies if recovery_strategies is not None else default_recovery_strategies(active_retrievers)
-        recovery_result = run_recovery(query, graded, strategies, grader=grader, graph_was_used=plan.graph)
-        graded = recovery_result.evidence
-        recovery_used = recovery_result.attempts_used > 0
+        with traced("recovery", request_id=request_id):
+            strategies = recovery_strategies if recovery_strategies is not None else default_recovery_strategies(active_retrievers)
+            recovery_result = run_recovery(query, graded, strategies, grader=grader, graph_was_used=plan.graph)
+            graded = recovery_result.evidence
+            recovery_used = recovery_result.attempts_used > 0
         if not recovery_result.recovered:
             return PipelineResult(plan=plan, route=route, evidence=graded, recovery_used=recovery_used, insufficient_evidence=True)
 

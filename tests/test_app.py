@@ -218,3 +218,43 @@ def test_insufficient_evidence_returns_fallback_and_skips_generation(client, mon
     assert body["answer"] == INSUFFICIENT_EVIDENCE_MESSAGE
     assert body["recovery_used"] is True
     assert generation_called == []  # no generation call was ever made
+
+
+# ---------------------------------------------------------------------------
+# Online eval collection (FR7) - real record_eval_event, real (fake) Redis
+# ---------------------------------------------------------------------------
+
+
+def test_mode2_records_eval_event_in_redis(client, fake_redis, monkeypatch):
+    """FR7 acceptance, matched literally: the grounding result is queryable
+    by request_id via Redis (already provisioned, Phase 1) immediately
+    after the response - not mocked away, `record_eval_event` runs for
+    real against the fake Redis client."""
+    monkeypatch.setattr(app_module, "run_pipeline", lambda q, rid: _result())
+    monkeypatch.setattr(app_module, "select_mode", lambda q: "mode2")
+    monkeypatch.setattr(app_module, "generate_buffered", lambda messages: "a grounded answer")
+    monkeypatch.setattr(app_module, "check_grounding", lambda answer, evidence: GroundingCheck(grounded=True, confidence=0.88))
+
+    resp = client.post("/v1/query", json={"query": "what dosage of X is safe"}, headers=HEADERS)
+    request_id = resp.json()["request_id"]
+
+    assert fake_redis.store[f"eval:{request_id}"] is not None
+    import json
+
+    stored = json.loads(fake_redis.store[f"eval:{request_id}"])
+    assert stored == {"route": "hybrid-rag", "recovery_used": False, "grounded": True, "confidence": 0.88}
+
+
+def test_mode1_streaming_records_eval_event_after_response(client, fake_redis, monkeypatch):
+    monkeypatch.setattr(app_module, "run_pipeline", lambda q, rid: _result())
+    monkeypatch.setattr(app_module, "select_mode", lambda q: "mode1")
+    monkeypatch.setattr(app_module, "generate_streaming", lambda messages: iter(["Hello"]))
+    monkeypatch.setattr(app_module, "check_grounding_async", lambda answer, evidence: _resolved_handle(grounded=True, confidence=0.95))
+
+    resp = client.post("/v1/query", json={"query": "hello"}, headers=HEADERS)
+
+    import json
+
+    done_line = next(line for line in resp.text.split("\n") if line.startswith("data:") and "request_id" in line)
+    request_id_value = json.loads(done_line[len("data: ") :])["request_id"]
+    assert f"eval:{request_id_value}" in fake_redis.store

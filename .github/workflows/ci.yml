@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  offline-eval-gate:
+    # SS7.8's actual deploy gate: the offline eval suite against the
+    # bootstrap golden set (eval_data/golden_set.json). Needs no secrets -
+    # planner (rule-based + spaCy) and grader/reranker (FastEmbed, local
+    # ONNX) all run fully offline. This job failing means "block
+    # deployment" (PRD's literal acceptance criterion for FR22-26).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .
+      - run: python -m adaptive_rag.eval
+
+  test-suite:
+    # Full pytest suite. Requires this repo's secrets to be configured
+    # (Settings → Secrets and variables → Actions) for tests that call real
+    # Groq/Neo4j/OpenSearch/Redis - GROQ_API_KEY, NEO4J_URI, NEO4J_USER,
+    # NEO4J_PASSWORD, OPENSEARCH_URL, OPENSEARCH_USER, OPENSEARCH_PASSWORD,
+    # REDIS_URL, API_KEY. This is an external action only the repo owner
+    # can perform (same shape as the OpenSearch/Neo4j signups themselves) -
+    # until those secrets are added, this job is expected to fail on the
+    # tests that need live infrastructure. The offline-eval-gate job above
+    # is the one guaranteed to pass with zero configuration.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .[dev]
+      - run: python -m pytest tests/ -q
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          NEO4J_URI: ${{ secrets.NEO4J_URI }}
+          NEO4J_USER: ${{ secrets.NEO4J_USER }}
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+          OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
+          OPENSEARCH_USER: ${{ secrets.OPENSEARCH_USER }}
+          OPENSEARCH_PASSWORD: ${{ secrets.OPENSEARCH_PASSWORD }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          API_KEY: ${{ secrets.API_KEY }}

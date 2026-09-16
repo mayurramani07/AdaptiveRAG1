@@ -1,0 +1,24 @@
+{
+  "_note": "Bootstrap golden set (Phase 8) - hand-labeled from documented planning/grading rules and verified 2026-09-16 against the real running code, NOT the production-scale dataset. SS9 (project context) and the PRD (SS14) both call for this to grow from flagged/reviewed production queries over time (Phase 9) - this is a starting point to make the offline eval suite runnable and real now, not the final dataset.",
+  "planner_examples": [
+    {"query": "What is the refund policy?", "expected": {"dense": true, "bm25": true, "graph": false, "freshness": false, "apply_filters": true}},
+    {"query": "hello", "expected": {"dense": false, "bm25": false, "graph": false, "freshness": false, "apply_filters": false}},
+    {"query": "thanks", "expected": {"dense": false, "bm25": false, "graph": false, "freshness": false, "apply_filters": false}},
+    {"query": "How is Steve Jobs connected to Apple and Beats?", "expected": {"dense": true, "bm25": true, "graph": true, "freshness": false, "apply_filters": false}},
+    {"query": "What is the relationship between Apple and Google?", "expected": {"dense": true, "bm25": true, "graph": true, "freshness": false, "apply_filters": false}},
+    {"query": "What is the latest policy update?", "expected": {"dense": true, "bm25": true, "graph": false, "freshness": true, "apply_filters": true}},
+    {"query": "Show me the 2023 finance report", "expected": {"dense": true, "bm25": true, "graph": false, "freshness": true, "apply_filters": true}},
+    {"query": "What is our HR policy on remote work?", "expected": {"dense": true, "bm25": true, "graph": false, "freshness": false, "apply_filters": true}}
+  ],
+  "grader_examples": [
+    {"query": "What is the refund policy?", "evidence_text": "The refund policy allows returns within 30 days of purchase.", "expected_grade": "correct"},
+    {"query": "What is the refund policy?", "evidence_text": "Bananas are a good source of potassium.", "expected_grade": "incorrect"},
+    {"query": "Who founded Apple?", "evidence_text": "Steve Jobs founded Apple in a garage in 1976.", "expected_grade": "correct"},
+    {"query": "Who founded Apple?", "evidence_text": "The weather today is sunny with a light breeze.", "expected_grade": "incorrect"},
+    {"query": "What is the capital of France?", "evidence_text": "Paris is the capital and largest city of France.", "expected_grade": "correct"}
+  ],
+  "reranker_examples": [
+    {"query": "What is the capital of France?", "documents": ["Paris is the capital of France.", "Bananas are yellow.", "The Eiffel Tower is in Paris."], "expected_best_index": 0},
+    {"query": "Who founded Apple?", "documents": ["Steve Jobs founded Apple in 1976.", "Apple pie is a dessert.", "The stock market closed higher today."], "expected_best_index": 0}
+  ]
+}

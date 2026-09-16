@@ -43,6 +43,7 @@ Neo4j, never a synthesized relationship-edge label.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Protocol
 
@@ -67,6 +68,10 @@ INDEX_MAPPING = {
             "doc_type": {"type": "keyword"},
             "department": {"type": "keyword"},
             "date": {"type": "keyword"},
+            # Phase 8 drift detection (observability.check_index_staleness) -
+            # when a chunk was last (re)indexed, not the document's own
+            # doc_type "date" filter field above.
+            "ingested_at": {"type": "date"},
             "embedding": {
                 "type": "knn_vector",
                 "dimension": EMBEDDING_DIM,
@@ -142,11 +147,14 @@ def index_chunk(
     it into OpenSearch keyed by chunk_id, so Dense/BM25Retriever can find it
     later. `metadata` (doc_type/department/date) is stored on the chunk doc
     if given, enabling filtered retrieval later - see module docstring for
-    why nothing currently supplies it automatically."""
+    why nothing currently supplies it automatically. `ingested_at` is
+    always set (not just when metadata is given) - Phase 8's
+    `observability.check_index_staleness` drift check needs it on every
+    chunk, not only filterable ones."""
     search_client = client or get_opensearch_client()
     provider = embedding_provider or get_embedding_provider()
     [vector] = provider.embed([text])
-    body = {"doc_id": doc_id, "chunk_id": chunk_id, "text": text, "embedding": vector}
+    body = {"doc_id": doc_id, "chunk_id": chunk_id, "text": text, "embedding": vector, "ingested_at": datetime.now(UTC).isoformat()}
     if metadata:
         body.update({k: v for k, v in metadata.items() if k in FILTERABLE_FIELDS})
     search_client.index(index=index, id=chunk_id, body=body)

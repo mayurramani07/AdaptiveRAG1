@@ -7,7 +7,6 @@ from adaptive_rag.recovery import (
     make_graph_expansion_strategy,
     make_internal_re_retrieval_strategy,
     make_query_rewrite_strategy,
-    redact_pii,
     run_recovery,
 )
 
@@ -226,28 +225,10 @@ def test_chaos_grader_always_incorrect_exactly_two_attempts_then_fallback_no_cra
 
 
 # ---------------------------------------------------------------------------
-# PII redaction (FR15)
+# PII redaction (FR15) - redact_pii's own behavior is covered in
+# tests/test_pii.py now that it lives in a shared module; this file only
+# covers RedactedWebSearch's own wrapping behavior.
 # ---------------------------------------------------------------------------
-
-
-def test_redact_pii_scrubs_email():
-    assert redact_pii("contact me at john.doe@example.com please") == "contact me at [REDACTED_EMAIL] please"
-
-
-def test_redact_pii_scrubs_phone_number():
-    assert "[REDACTED_PHONE]" in redact_pii("call me at 415-555-2671 tomorrow")
-
-
-def test_redact_pii_scrubs_ssn():
-    assert "[REDACTED_SSN]" in redact_pii("my ssn is 123-45-6789")
-
-
-def test_redact_pii_scrubs_credit_card():
-    assert "[REDACTED_CARD]" in redact_pii("card number 4111 1111 1111 1111 expires soon")
-
-
-def test_redact_pii_leaves_clean_text_untouched():
-    assert redact_pii("what is the refund policy") == "what is the refund policy"
 
 
 def test_redacted_web_search_never_sends_raw_pii_to_backend():
