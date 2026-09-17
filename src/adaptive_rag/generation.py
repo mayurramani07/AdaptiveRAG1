@@ -62,13 +62,29 @@ def build_context(query: str, graded_evidence: list[dict]) -> list[dict]:
     ]
 
 
+SOURCE_TEXT_SNIPPET_CHARS = 300
+
+
 def extract_sources(graded_evidence: list[dict]) -> list[dict]:
     """API contract (SS9.1): the `sources` list attached to a response,
     tagging trust_tier explicitly so a client never has to guess whether a
-    source is authoritative or (web-search) supplementary."""
+    source is authoritative or (web-search) supplementary.
+
+    `text` (Phase 10/frontend): a snippet of the evidence's own already-
+    resolved chunk text (SS3's invariant - never a raw graph edge label),
+    truncated so a source card renders a preview rather than the full
+    passage. No document "title" field exists anywhere in the ingestion
+    pipeline (SS3 tracks doc_id only) - inventing one would be fake UI
+    data, so `doc_id` is the only document-identifying field."""
     trusted = [e for e in graded_evidence if e.get("grade") != Grade.INCORRECT]
     return [
-        {"id": e.get("chunk_id", e.get("id")), "doc_id": e.get("doc_id"), "trust_tier": e.get("trust_tier", "authoritative"), "score": e.get("grader_score")}
+        {
+            "id": e.get("chunk_id", e.get("id")),
+            "doc_id": e.get("doc_id"),
+            "trust_tier": e.get("trust_tier", "authoritative"),
+            "score": e.get("grader_score"),
+            "text": (e.get("text") or "")[:SOURCE_TEXT_SNIPPET_CHARS],
+        }
         for e in trusted
     ]
 

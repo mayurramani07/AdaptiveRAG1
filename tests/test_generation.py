@@ -117,6 +117,22 @@ def test_extract_sources_excludes_incorrect_evidence():
     assert sources[0]["id"] == "a"
 
 
+def test_extract_sources_includes_text_snippet():
+    # Phase 10 (frontend Sources panel) - a source card needs more than a
+    # bare id to be presentable.
+    evidence = [_evidence("a", "the chunk's actual resolved text", Grade.CORRECT)]
+    sources = extract_sources(evidence)
+    assert sources[0]["text"] == "the chunk's actual resolved text"
+
+
+def test_extract_sources_truncates_long_text_snippet():
+    from adaptive_rag.generation import SOURCE_TEXT_SNIPPET_CHARS
+
+    evidence = [_evidence("a", "x" * 1000, Grade.CORRECT)]
+    sources = extract_sources(evidence)
+    assert len(sources[0]["text"]) == SOURCE_TEXT_SNIPPET_CHARS
+
+
 # ---------------------------------------------------------------------------
 # Streaming vs buffered (FR17, NFR7) - same underlying client either way
 # ---------------------------------------------------------------------------

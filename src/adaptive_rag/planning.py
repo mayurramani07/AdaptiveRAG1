@@ -51,6 +51,66 @@ _DEPARTMENT_WORDS = ("hr", "finance", "engineering", "legal", "sales", "marketin
 _CHITCHAT_PATTERNS = {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "bye", "goodbye", "test"}
 
 
+def _one_edit_away(a: str, b: str) -> bool:
+    """True if `a` can become `b` via at most one character insert/delete/
+    substitute - catches common typos ("hii"/"hi", "heyy"/"hey") without a
+    fuzzy-matching dependency. Real-world gap found 2026-09-17: "hii" fell
+    through exact matching, ran a full (pointless) retrieval+CRAG-recovery
+    cycle, and correctly-but-confusingly reported insufficient evidence for
+    what was obviously just a greeting."""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(1 for x, y in zip(a, b) if x != y) == 1
+    shorter, longer = (a, b) if len(a) < len(b) else (b, a)
+    i = j = 0
+    seen_diff = False
+    while i < len(shorter) and j < len(longer):
+        if shorter[i] == longer[j]:
+            i += 1
+            j += 1
+            continue
+        if seen_diff:
+            return False
+        seen_diff = True
+        j += 1
+    return True
+
+
+def _collapse_repeated_chars(s: str) -> str:
+    """Collapses runs of 2+ identical consecutive characters to one -
+    normalizes key-mashed emphasis typing ("hiiii", "heyyyy", "okkkkk", any
+    number of repeats) to its canonical form. Applied to both the query and
+    the patterns before comparing, so "hello" and a mashed "hellllooo" both
+    collapse to the same "helo" and compare equal. Real-world gap found
+    2026-09-17: "HIIII" (4 repeated letters) was still beyond the original
+    single-typo tolerance."""
+    if not s:
+        return s
+    result = [s[0]]
+    for ch in s[1:]:
+        if ch != result[-1]:
+            result.append(ch)
+    return "".join(result)
+
+
+_COLLAPSED_CHITCHAT_PATTERNS = {_collapse_repeated_chars(p) for p in _CHITCHAT_PATTERNS}
+_MAX_COLLAPSED_CHITCHAT_PATTERN_LEN = max(len(p) for p in _COLLAPSED_CHITCHAT_PATTERNS)
+
+
+def _is_chitchat_like(normalized: str) -> bool:
+    if normalized in _CHITCHAT_PATTERNS:
+        return True
+    collapsed = _collapse_repeated_chars(normalized)
+    if collapsed in _COLLAPSED_CHITCHAT_PATTERNS:
+        return True
+    if len(collapsed) > _MAX_COLLAPSED_CHITCHAT_PATTERN_LEN + 1:
+        return False  # too long to be a one-typo-away greeting even after collapsing repeats
+    return any(_one_edit_away(collapsed, pattern) for pattern in _COLLAPSED_CHITCHAT_PATTERNS)
+
+
 @lru_cache
 def _get_nlp():
     return spacy.load("en_core_web_sm")
@@ -86,7 +146,7 @@ class RetrievalPlan:
 
 def understand_query(query: str) -> QueryUnderstanding:
     normalized = query.strip().lower().rstrip(".!?")
-    if normalized in _CHITCHAT_PATTERNS or len(normalized) < 3:
+    if _is_chitchat_like(normalized) or len(normalized) < 3:
         return QueryUnderstanding(is_chitchat=True)
 
     doc = _get_nlp()(query)

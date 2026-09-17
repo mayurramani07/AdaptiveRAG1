@@ -18,6 +18,8 @@ dependencies = [
     "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
     "fastembed>=0.8",
     "opensearch-py>=3.0",
+    "python-multipart>=0.0.12",
+    "pypdf>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -32,3 +34,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's DI reads File(...)/Form(...) as parameter defaults - it's the
+# framework's actual API, not a mutable-default bug (B008's ruff-default
+# exemption list already covers fastapi.Depends/Query; File/Form need adding
+# explicitly for the new /v1/documents upload endpoint, Phase 11).
+extend-immutable-calls = ["fastapi.File", "fastapi.Form"]

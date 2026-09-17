@@ -17,7 +17,10 @@ unrelated entities that happen to share a surface form.
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -25,7 +28,16 @@ from typing import Any, Protocol
 
 from adaptive_rag.config import get_settings
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_CHUNK_WORDS = 200
+# Defense-in-depth backstop, not the primary chunk-size control (that's
+# DEFAULT_CHUNK_WORDS): word-count chunking assumes reasonably-sized
+# "words". Pathological input (e.g. one giant whitespace-free blob -
+# minified data pasted as "text", a corrupted extraction) would otherwise
+# produce one arbitrarily large chunk that bypasses the word-count grouping
+# entirely. Real prose never approaches this; only degenerate input does.
+DEFAULT_MAX_CHUNK_CHARS = 4_000
 DEFAULT_MIN_RELATIONSHIP_CONFIDENCE = 0.5
 
 _SUFFIXES = ("inc.", "inc", "corp.", "corp", "llc", "ltd.", "ltd", "co.", "co")
@@ -110,25 +122,70 @@ def get_neo4j_driver() -> Neo4jLike:
 
 class GroqLLMClient:
     """Calls Groq's OpenAI-compatible chat completions endpoint with the
-    small extraction model - never `settings.groq_model` (FR18/NFR4)."""
+    small extraction model - never `settings.groq_model` (FR18/NFR4).
+
+    MAX_RETRIES: a large document now makes many sequential calls here (one
+    per chunk, from `ingest_document`'s loop) - large enough, for a
+    genuinely big document, to trip Groq's free-tier rate limit mid-upload
+    (surfaced by the 106k-char architecture fix, not present before it,
+    since the old document-level char cap never let a document produce
+    enough chunks to hit this). Retries with backoff (honoring `Retry-After`
+    when Groq sends one) rather than failing the whole upload on one
+    transient 429."""
+
+    MAX_RETRIES = 5
+    # Groq's own Retry-After can legitimately be very large under heavy
+    # free-tier load (216s observed live 2026-09-17) - honoring it verbatim
+    # made one stubborn chunk cost 15-20+ minutes across its retries. Since
+    # `ingest_document` now treats a chunk's exhausted-retries failure as
+    # skip-and-continue (not fatal), there's no reason to wait that long
+    # per attempt - capping bounds worst-case per-chunk cost to
+    # MAX_RETRIES * this value while still giving every 429 a real retry.
+    MAX_RETRY_WAIT_SECONDS = 30.0
 
     def complete_json(self, system: str, user: str) -> str:
         import httpx
 
         settings = get_settings()
-        response = httpx.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-            json={
-                "model": settings.groq_extraction_model,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                "response_format": {"type": "json_object"},
-                "temperature": 0,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        payload = {
+            "model": settings.groq_extraction_model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+        }
+        headers = {"Authorization": f"Bearer {settings.groq_api_key}"}
+
+        for attempt in range(self.MAX_RETRIES + 1):
+            response = httpx.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
+            if response.status_code == 429 and attempt < self.MAX_RETRIES:
+                try:
+                    # Retry-After is allowed by spec to be an HTTP-date
+                    # instead of a second count - fall back rather than
+                    # crash on an unparseable value.
+                    wait_seconds = float(response.headers.get("retry-after", 2**attempt))
+                except ValueError:
+                    wait_seconds = float(2**attempt)
+                wait_seconds = min(wait_seconds, self.MAX_RETRY_WAIT_SECONDS)
+                # Without this log line, a long real Retry-After wait (Groq
+                # can legitimately ask for 60-90s+ under heavy load) is
+                # silent and indistinguishable from a genuine hang - real
+                # confusion hit live 2026-09-17 debugging exactly this.
+                logger.info(
+                    "groq_rate_limited_retrying",
+                    extra={"attempt": attempt + 1, "max_retries": self.MAX_RETRIES, "wait_seconds": wait_seconds},
+                )
+                time.sleep(wait_seconds)
+                continue
+            if response.status_code >= 400:
+                # Non-retryable (or retries exhausted) - log the actual
+                # response body before raising. Without this, a 400 only
+                # ever showed "Client error '400 Bad Request'" with no way
+                # to tell why - real gap hit 2026-09-17 diagnosing a live
+                # failure with no visibility into Groq's actual complaint.
+                logger.warning("groq_extraction_call_failed", extra={"status_code": response.status_code, "response_body": response.text[:2000]})
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        raise AssertionError("unreachable - loop always returns or raises")
 
 
 @lru_cache
@@ -143,14 +200,25 @@ def _safe_json(raw: str) -> Any | None:
         return None
 
 
-def chunk_document(doc_id: str, text: str, chunk_words: int = DEFAULT_CHUNK_WORDS) -> list[Chunk]:
+def chunk_document(
+    doc_id: str, text: str, chunk_words: int = DEFAULT_CHUNK_WORDS, max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS
+) -> list[Chunk]:
     # ponytail: fixed word-count chunks, no overlap/sentence-awareness.
     # Add overlap if answers start citing boundary-split context wrong.
     words = text.split()
-    chunks = [
-        Chunk(doc_id=doc_id, chunk_id=f"{doc_id}:{i // chunk_words}", text=" ".join(words[i : i + chunk_words]))
-        for i in range(0, len(words), chunk_words)
+    word_groups = [" ".join(words[i : i + chunk_words]) for i in range(0, len(words), chunk_words)]
+
+    # Backstop for pathological input a word-count split can't bound (see
+    # DEFAULT_MAX_CHUNK_CHARS) - hard-splits by character count. A no-op for
+    # any real document: chunk_words already keeps ordinary prose well under
+    # max_chunk_chars, so this only ever fires on degenerate input.
+    pieces = [
+        group[i : i + max_chunk_chars]
+        for group in word_groups
+        for i in range(0, len(group), max_chunk_chars)
     ]
+
+    chunks = [Chunk(doc_id=doc_id, chunk_id=f"{doc_id}:{i}", text=piece) for i, piece in enumerate(pieces)]
     return chunks or [Chunk(doc_id=doc_id, chunk_id=f"{doc_id}:0", text="")]
 
 
@@ -379,14 +447,26 @@ def load_into_neo4j(
 
 
 def ingest_document(driver: Neo4jLike, doc_id: str, text: str, llm: LLMLike | None = None) -> None:
-    """Runs the full pipeline for one document."""
+    """Runs the full pipeline for one document.
+
+    A single chunk's extraction failing (e.g. a non-retryable Groq error on
+    one chunk's content, surfaced 2026-09-17 processing a real large
+    document) must not crash the whole document - that chunk is skipped
+    (still indexed into OpenSearch for Dense/BM25 retrieval by the caller,
+    `retrieval.ingest_and_index` - only its graph-derived entities/
+    relationships are lost) and the rest proceed. Same "degrade one unit,
+    don't crash the whole request" principle as `planning.execute_plan`'s
+    per-retriever handling and `extract_entities`'s invalid-output handling."""
     chunks = chunk_document(doc_id, text)
     all_mentions: list[EntityMention] = []
     all_relationships: list[Relationship] = []
     for chunk in chunks:
-        mentions = extract_entities(chunk, llm=llm)
-        all_mentions.extend(mentions)
-        all_relationships.extend(extract_relationships(chunk, mentions, llm=llm))
+        try:
+            mentions = extract_entities(chunk, llm=llm)
+            all_mentions.extend(mentions)
+            all_relationships.extend(extract_relationships(chunk, mentions, llm=llm))
+        except Exception:
+            logger.warning("chunk_extraction_failed", extra={"doc_id": doc_id, "chunk_id": chunk.chunk_id}, exc_info=True)
     registry = resolve_entities(all_mentions, llm=llm)
     validated = validate_relationships(all_relationships)
     load_into_neo4j(driver, doc_id, chunks, all_mentions, registry, validated)
@@ -415,3 +495,39 @@ def sync_graph(driver: Neo4jLike, documents: dict[str, str], llm: LLMLike | None
     driver.execute_query("MATCH (e:Entity) WHERE NOT (e)-[:MENTIONED_IN]->() DETACH DELETE e")
     for doc_id, text in documents.items():
         ingest_document(driver, doc_id, text, llm=llm)
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 (FR-ING5, reverses NG8): POST /v1/documents upload support.
+# Text extraction only - the actual pipeline is unchanged, reused as-is via
+# retrieval.ingest_and_index (app.py wires this together).
+# ---------------------------------------------------------------------------
+
+_UPLOAD_ID_RE = re.compile(r"[^a-z0-9]+")
+
+
+def sanitize_upload_doc_id(filename: str) -> str:
+    """Every upload gets a fresh doc_id (readable prefix + a short random
+    suffix) - there is no update-in-place (NG8: re-uploading a changed file
+    creates a new document, never overwrites the old one)."""
+    stem = filename.rsplit(".", 1)[0].lower()
+    slug = _UPLOAD_ID_RE.sub("-", stem).strip("-")[:50] or "document"
+    return f"{slug}-{uuid.uuid4().hex[:8]}"
+
+
+def extract_upload_text(filename: str, content: bytes) -> str:
+    """Raises ValueError for an unsupported file type - app.py maps that to
+    HTTP 400. `.pdf` via `pypdf` (pure-Python, no system dependency);
+    `.txt` decoded as UTF-8, replacing undecodable bytes rather than
+    failing the whole upload over one bad byte."""
+    lower = filename.lower()
+    if lower.endswith(".pdf"):
+        from io import BytesIO
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(BytesIO(content))
+        return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    if lower.endswith(".txt"):
+        return content.decode("utf-8", errors="replace").strip()
+    raise ValueError(f"unsupported file type: {filename!r} - only .pdf and .txt are accepted")

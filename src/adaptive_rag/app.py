@@ -3,12 +3,14 @@ import logging
 import time
 import uuid
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
+from adaptive_rag.config import get_settings
 from adaptive_rag.gateway import (
     cache_get,
     cache_set,
@@ -27,21 +29,101 @@ from adaptive_rag.grounding import (
     is_passed,
     select_mode,
 )
+from adaptive_rag.ingestion import (
+    chunk_document,
+    extract_upload_text,
+    get_llm_client,
+    get_neo4j_driver,
+    sanitize_upload_doc_id,
+)
 from adaptive_rag.logging import configure_logging
 from adaptive_rag.observability import check_dependency_health, record_eval_event
 from adaptive_rag.pipeline import run_pipeline
 from adaptive_rag.recovery import INSUFFICIENT_EVIDENCE_MESSAGE
+from adaptive_rag.retrieval import ingest_and_index
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Adaptive RAG")
 
+# PRD SS10/19.2: an explicit origin allowlist for the frontend (Phase 10) -
+# never "*", fails closed if CORS_ALLOWED_ORIGINS is empty/unset rather than
+# permitting every origin.
+_cors_origins = [origin.strip() for origin in get_settings().cors_allowed_origins.split(",") if origin.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-API-Key", "Content-Type"],
+)
+
 
 @app.get("/v1/health")
 async def health() -> dict:
     deps = await check_dependency_health()
     return {"status": "ok" if all(v == "ok" for v in deps.values()) else "degraded", "dependencies": deps}
+
+
+# FR-ING5 (Phase 11, reverses NG8) upload limits - two DIFFERENT concerns,
+# enforced at two DIFFERENT stages, deliberately not one number:
+#
+# MAX_DOCUMENT_CHARS is a document-level sanity guard against genuinely
+# unsafe/unbounded input (a corrupted extraction, a deliberately oversized
+# paste) - NOT a proxy for how long ingestion will take. A real 100+ page
+# report is well within this.
+MAX_DOCUMENT_CHARS = 500_000
+
+# MAX_CHUNKS_PER_UPLOAD is the actual cost/time driver: ingest_document
+# (ingestion.py) makes 2 sequential LLM calls per chunk (extract_entities +
+# extract_relationships), all inside this one blocking HTTP request (no
+# background job - a deliberate Phase 11 simplification, NG8). This is the
+# correct boundary for a "can this be processed synchronously" check -
+# checked AFTER chunking, not by gating on raw pre-chunk document length.
+# 150 chunks * 200 words/chunk (DEFAULT_CHUNK_WORDS) = ~30k words, which
+# comfortably covers a real ~100k-character report (~90 chunks) with
+# headroom, while keeping worst-case synchronous processing time bounded on
+# free-tier infra. Raise this only alongside moving ingestion to a
+# background job (out of scope here), not in isolation.
+MAX_CHUNKS_PER_UPLOAD = 150
+
+
+@app.post("/v1/documents")
+async def upload_document(
+    file: UploadFile = File(...),
+    doc_type: str | None = Form(default=None),
+    department: str | None = Form(default=None),
+    date: str | None = Form(default=None),
+    api_key: str = Depends(require_api_key),
+) -> dict:
+    content = await file.read()
+    try:
+        text = extract_upload_text(file.filename or "", content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not text:
+        raise HTTPException(status_code=400, detail="no extractable text found in the uploaded file")
+    if len(text) > MAX_DOCUMENT_CHARS:
+        raise HTTPException(status_code=413, detail=f"document too large ({len(text)} chars, max {MAX_DOCUMENT_CHARS})")
+
+    doc_id = sanitize_upload_doc_id(file.filename or "document")
+    chunks = chunk_document(doc_id, text)
+    if len(chunks) > MAX_CHUNKS_PER_UPLOAD:
+        raise HTTPException(
+            status_code=413,
+            detail=f"document produces too many chunks to process synchronously ({len(chunks)} chunks, max {MAX_CHUNKS_PER_UPLOAD})",
+        )
+    metadata = {k: v for k, v in {"doc_type": doc_type, "department": department, "date": date}.items() if v}
+
+    def _ingest() -> int:
+        driver = get_neo4j_driver()
+        llm = get_llm_client()
+        ingest_and_index(driver, doc_id, text, llm=llm, metadata=metadata or None)
+        return len(chunks)
+
+    chunks_indexed = await run_in_threadpool(_ingest)
+    return {"doc_id": doc_id, "filename": file.filename, "chunks_indexed": chunks_indexed}
 
 
 class QueryRequest(BaseModel):

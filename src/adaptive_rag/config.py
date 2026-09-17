@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     api_key: str = ""
     rate_limit_per_minute: int = 60
 
+    # Frontend integration (Phase 10, PRD SS10/19.2): comma-separated browser
+    # origins allowed to call this API. Defaults to local Vite dev only -
+    # production (Vercel) origins must be added explicitly, never "*".
+    cors_allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+
     cache_ttl_seconds: int = 86400
     embedding_provider: str = ""
     # Dense retrieval's embedding model (Phase 4). Local/free via FastEmbed

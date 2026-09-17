@@ -38,6 +38,35 @@ def test_understand_query_detects_chitchat():
     assert u.entities == [] and u.filter_candidates == {}
 
 
+@pytest.mark.parametrize("greeting_typo", ["hii", "heyy", "helo", "okk", "byee", "thnks", "HIIII", "hiiiiiiii", "heyyyyy", "okkkkk"])
+def test_understand_query_detects_common_greeting_typos_as_chitchat(greeting_typo):
+    # Real gap found 2026-09-17: "hii" fell through exact matching, ran a
+    # full retrieval+recovery cycle, and confusingly reported insufficient
+    # evidence for what was obviously a greeting.
+    assert understand_query(greeting_typo).is_chitchat is True
+
+
+@pytest.mark.parametrize(
+    "real_query",
+    ["what is the refund policy", "who is the CEO of Acme Corporation", "how do I file an expense report"],
+)
+def test_understand_query_does_not_misclassify_real_short_questions_as_chitchat(real_query):
+    assert understand_query(real_query).is_chitchat is False
+
+
+def test_understand_query_does_not_treat_a_greeting_prefix_on_a_real_question_as_chitchat():
+    # A mashed greeting followed by an actual question must still run
+    # retrieval - only a message that IS (a typo/repeat of) a greeting,
+    # nothing else, counts as chitchat.
+    assert understand_query("hiii, what is the refund policy").is_chitchat is False
+
+
+def test_understand_query_rejects_words_too_different_from_any_greeting():
+    # "no" was never a supported chitchat pattern - collapsing repeats
+    # doesn't invent new matches beyond the existing pattern set.
+    assert understand_query("nooo").is_chitchat is False
+
+
 def test_understand_query_extracts_entities():
     u = understand_query("What did Steve Jobs say about Apple?")
     assert "Steve Jobs" in u.entities

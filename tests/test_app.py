@@ -81,6 +81,27 @@ HEADERS = {"x-api-key": "test-key"}
 
 
 # ---------------------------------------------------------------------------
+# CORS (Phase 10, frontend integration, PRD SS10) - allowlist, never "*"
+# ---------------------------------------------------------------------------
+
+
+def test_cors_allows_configured_frontend_origin(client):
+    resp = client.options(
+        "/v1/query",
+        headers={"Origin": "http://localhost:5173", "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "x-api-key"},
+    )
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+def test_cors_rejects_unlisted_origin(client):
+    resp = client.options(
+        "/v1/query",
+        headers={"Origin": "http://evil.example.com", "Access-Control-Request-Method": "POST"},
+    )
+    assert resp.headers.get("access-control-allow-origin") is None
+
+
+# ---------------------------------------------------------------------------
 # GET /v1/health (Phase 9 hardening, SS9.2)
 # ---------------------------------------------------------------------------
 
@@ -103,6 +124,163 @@ def test_health_reports_degraded_when_one_dependency_down(client, monkeypatch):
     resp = client.get("/v1/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "degraded"
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/documents (Phase 11, FR-ING5, reverses NG8)
+# ---------------------------------------------------------------------------
+
+
+def _patch_ingestion(monkeypatch, ingest_calls):
+    monkeypatch.setattr(app_module, "get_neo4j_driver", lambda: "fake-driver")
+    monkeypatch.setattr(app_module, "get_llm_client", lambda: "fake-llm")
+
+    def fake_ingest_and_index(driver, doc_id, text, llm=None, metadata=None):
+        ingest_calls.append((doc_id, text, metadata))
+
+    monkeypatch.setattr(app_module, "ingest_and_index", fake_ingest_and_index)
+
+
+def test_upload_document_indexes_a_txt_file(client, monkeypatch):
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    resp = client.post(
+        "/v1/documents",
+        files={"file": ("notes.txt", b"Acme Corporation's refund policy allows returns within 30 days.", "text/plain")},
+        headers=HEADERS,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["filename"] == "notes.txt"
+    assert body["doc_id"].startswith("notes-")
+    assert body["chunks_indexed"] == 1
+    assert len(calls) == 1
+    assert calls[0][1] == "Acme Corporation's refund policy allows returns within 30 days."
+
+
+def test_upload_document_passes_through_metadata(client, monkeypatch):
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    resp = client.post(
+        "/v1/documents",
+        files={"file": ("policy.txt", b"some policy text", "text/plain")},
+        data={"doc_type": "policy", "department": "finance"},
+        headers=HEADERS,
+    )
+
+    assert resp.status_code == 200
+    assert calls[0][2] == {"doc_type": "policy", "department": "finance"}
+
+
+def test_upload_document_rejects_unsupported_file_type(client, monkeypatch):
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    resp = client.post("/v1/documents", files={"file": ("image.png", b"\x89PNG", "image/png")}, headers=HEADERS)
+
+    assert resp.status_code == 400
+    assert calls == []
+
+
+def test_upload_document_rejects_empty_file(client, monkeypatch):
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    resp = client.post("/v1/documents", files={"file": ("empty.txt", b"   \n\n  ", "text/plain")}, headers=HEADERS)
+
+    assert resp.status_code == 400
+    assert "no extractable text" in resp.json()["detail"]
+    assert calls == []
+
+
+def test_upload_document_accepts_a_document_slightly_above_the_old_8000_char_limit(client, monkeypatch):
+    # Regression test for the bug this fix addresses: an 8,000-character
+    # cap was previously applied to the whole raw document before chunking
+    # ever ran. A ~15,000-character document is a perfectly reasonable
+    # document and must now be accepted.
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    text = ("word " * 3000).encode()  # ~15,000 chars - was rejected before this fix
+    resp = client.post("/v1/documents", files={"file": ("medium.txt", text, "text/plain")}, headers=HEADERS)
+
+    assert resp.status_code == 200
+    assert resp.json()["chunks_indexed"] > 1  # actually went through chunking, not a single blob
+    assert len(calls) == 1
+
+
+def test_upload_document_accepts_a_100k_char_document_and_splits_it_into_many_chunks(client, monkeypatch):
+    # The literal scenario reported: a ~106k-character real-world PDF (NIST
+    # AI RMF) must be accepted and chunked, not rejected outright.
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    sentence = "The quick brown fox jumps over the lazy dog. "
+    text = (sentence * (106_000 // len(sentence))).encode()
+    assert 100_000 < len(text) < 110_000
+
+    resp = client.post("/v1/documents", files={"file": ("nist-ai-rmf.txt", text, "text/plain")}, headers=HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["chunks_indexed"] > 50  # genuinely split into many chunks, not one
+    assert len(calls) == 1
+    assert calls[0][1] == text.decode().strip()  # full text reached ingestion, nothing silently truncated
+
+
+def test_upload_document_rejects_genuinely_unbounded_document(client, monkeypatch):
+    # Document-level validation still exists - it's just no longer scoped
+    # to "any real document", only to genuinely unsafe/unbounded input.
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    text = ("x " * 300_000).encode()  # ~600,000 chars - over MAX_DOCUMENT_CHARS (500,000)
+    resp = client.post("/v1/documents", files={"file": ("huge.txt", text, "text/plain")}, headers=HEADERS)
+
+    assert resp.status_code == 413
+    assert "document too large" in resp.json()["detail"]
+    assert calls == []
+
+
+def test_upload_document_rejects_when_chunk_count_exceeds_the_synchronous_processing_cap(client, monkeypatch):
+    # A document under MAX_DOCUMENT_CHARS can still produce more chunks
+    # than can reasonably be processed inside one blocking HTTP request
+    # (2 LLM calls/chunk) - that must be caught by the chunk-count cap, not
+    # the document-level char cap (this text is well under 500,000 chars).
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    text = ("word " * 30_200).encode()  # ~151,000 chars, ~151 chunks at 200 words/chunk
+    assert len(text) < app_module.MAX_DOCUMENT_CHARS
+
+    resp = client.post("/v1/documents", files={"file": ("toolong.txt", text, "text/plain")}, headers=HEADERS)
+
+    assert resp.status_code == 413
+    assert "too many chunks" in resp.json()["detail"]
+    assert calls == []
+
+
+def test_upload_document_requires_auth(client, monkeypatch):
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    resp = client.post("/v1/documents", files={"file": ("notes.txt", b"hello", "text/plain")})
+
+    assert resp.status_code == 401
+    assert calls == []
+
+
+def test_upload_document_two_uploads_of_same_filename_get_different_doc_ids(client, monkeypatch):
+    calls = []
+    _patch_ingestion(monkeypatch, calls)
+
+    resp1 = client.post("/v1/documents", files={"file": ("notes.txt", b"version one", "text/plain")}, headers=HEADERS)
+    resp2 = client.post("/v1/documents", files={"file": ("notes.txt", b"version two", "text/plain")}, headers=HEADERS)
+
+    assert resp1.json()["doc_id"] != resp2.json()["doc_id"]  # NG8: no update-in-place
 
 
 # ---------------------------------------------------------------------------
